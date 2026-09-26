@@ -1,4 +1,114 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:1080px;margin:32px auto;padding:0 16px}
+select,button,input{padding:8px;margin:4px}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px;vertical-align:top}
+.tag{padding:2px 10px;border-radius:12px;font-size:13px;white-space:nowrap}
+.st-submitted{background:#fff3cd}.st-approved{background:#d1e7dd}.st-rejected{background:#f8d7da}
+.st-invalidated{background:#e2e3e5}.st-returned{background:#cff4fc}
+ul.blockers,ul.conflicts{margin:4px 0;padding-left:18px;font-size:13px}
+ul.blockers{color:#842029}ul.conflicts{color:#664d03}
+#msg{padding:8px;border-radius:6px;margin:8px 0;display:none}
+#msg.err{display:block;background:#f8d7da;color:#842029}
+#msg.ok{display:block;background:#d1e7dd;color:#0f5132}
+</style></head>
+<body>
+<h1>藏品来源与返还审查</h1>
+<div class="panel">
+  <label>演示身份 <select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select></label>
+  <button onclick="loadAll()">查看当前角色可见藏品</button>
+  <pre id="out"></pre>
+</div>
+<div class="panel" id="loanPanel" hidden>
+  <h2>藏品临时外借审批</h2>
+  <div id="loanForm" hidden>
+    <h3>提交外借申请（工作人员）</h3>
+    <select id="loanObject"></select>
+    <input type="date" id="loanStart"> 至 <input type="date" id="loanEnd">
+    <input id="loanPurpose" placeholder="用途，如：赴甲馆特展" size="28">
+    <button onclick="submitLoan()">提交申请</button>
+  </div>
+  <h3>外借申请 <button onclick="loadLoans()">刷新</button></h3>
+  <div id="msg"></div>
+  <table id="loans"><thead><tr>
+    <th>#</th><th>藏品</th><th>借展时段</th><th>用途</th><th>状态</th><th>阻塞原因 / 冲突项</th><th>操作</th>
+  </tr></thead><tbody></tbody></table>
+  <pre id="loanDetail" hidden></pre>
+</div>
+<script>
+const STATUS={submitted:"待审批",approved:"已批准·借出中",rejected:"已驳回",invalidated:"批准已失效",returned:"已归还·留档"};
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path,opts={}){
+  const r=await fetch(path,Object.assign({headers:{"X-User-Id":user.value,"Content-Type":"application/json"}},opts));
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok){const e=new Error((data.error&&data.error.message)||r.statusText);e.data=data;throw e}
+  return data;
+}
+function showMsg(text,ok){msg.textContent=text;msg.className=ok?"ok":"err"}
+async function loadAll(){
+  out.textContent="";
+  try{
+    const data=await api("/api/objects");
+    out.textContent=JSON.stringify(data,null,2);
+    loanObject.innerHTML=data.items.map(o=>`<option value="${o.id}">${esc(o.inventory_no)} ${esc(o.title)}</option>`).join("");
+    const canLoan=["staff","reviewer1"].includes(user.value);
+    loanPanel.hidden=!canLoan;
+    loanForm.hidden=user.value!=="staff";
+    if(canLoan)await loadLoans();
+  }catch(e){out.textContent=e.message}
+}
+async function loadLoans(){
+  try{renderLoans((await api("/api/loans")).items)}catch(e){showMsg(e.message,false)}
+}
+function renderLoans(items){
+  const tb=document.querySelector("#loans tbody");
+  tb.innerHTML=items.map(l=>{
+    let issues="";
+    if(l.blockers&&l.blockers.length)issues+=`<ul class="blockers">${l.blockers.map(b=>`<li>${esc(b.message)}</li>`).join("")}</ul>`;
+    if(l.conflicts&&l.conflicts.length)issues+=`<ul class="conflicts">${l.conflicts.map(c=>`<li>[${esc(c.at||"")}] ${esc(c.label)}</li>`).join("")}</ul>`;
+    if(!issues)issues=l.status==="submitted"?'<span style="color:#0f5132">无阻塞，可批准</span>':"—";
+    let ops=`<button onclick="showLoan(${l.id})">详情</button>`;
+    if(user.value==="reviewer1"&&l.status==="submitted")
+      ops+=`<button onclick="reviewLoan(${l.id},'approve')">批准</button><button onclick="reviewLoan(${l.id},'reject')">驳回</button>`;
+    if(user.value==="staff"&&(l.status==="approved"||l.status==="invalidated"))
+      ops+=`<button onclick="returnLoan(${l.id})">登记归还</button>`;
+    return `<tr><td>${l.id}</td><td>${esc(l.inventory_no)} ${esc(l.title)}</td><td>${l.loan_start} ~ ${l.loan_end}</td><td>${esc(l.purpose)}</td><td><span class="tag st-${l.status}">${STATUS[l.status]||l.status}</span></td><td>${issues}</td><td>${ops}</td></tr>`;
+  }).join("")||'<tr><td colspan="7">暂无外借申请</td></tr>';
+}
+async function submitLoan(){
+  try{
+    await api("/api/loans",{method:"POST",body:JSON.stringify({object_id:+loanObject.value,loan_start:loanStart.value,loan_end:loanEnd.value,purpose:loanPurpose.value})});
+    showMsg("外借申请已提交，等待审查员审批。",true);await loadLoans();
+  }catch(e){showMsg(e.message,false)}
+}
+async function reviewLoan(id,decision){
+  const note=prompt(decision==="approve"?"批准说明（至少 5 字）":"驳回说明（至少 5 字）");
+  if(note==null)return;
+  try{
+    await api(`/api/loans/${id}/review`,{method:"POST",body:JSON.stringify({decision,note})});
+    showMsg(decision==="approve"?"已批准外借。":"已驳回该申请。",true);
+  }catch(e){
+    const bs=e.data&&e.data.blockers;
+    showMsg(e.message+(bs?"："+bs.map(b=>b.message).join("；"):""),false);
+  }
+  await loadLoans();
+}
+async function returnLoan(id){
+  const note=prompt("归还备注（留档）","");if(note==null)return;
+  try{
+    await api(`/api/loans/${id}/return`,{method:"POST",body:JSON.stringify({note})});
+    showMsg("已登记归还并留档。",true);await loadLoans();
+  }catch(e){showMsg(e.message,false)}
+}
+async function showLoan(id){
+  try{
+    loanDetail.hidden=false;
+    loanDetail.textContent=JSON.stringify(await api(`/api/loans/${id}`),null,2);
+  }catch(e){showMsg(e.message,false)}
+}
+user.addEventListener("change",loadAll);
+</script>
+</body></html>

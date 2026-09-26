@@ -11,7 +11,7 @@ import threading
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "provenance.db"
@@ -25,9 +25,10 @@ CLAIM_TRANSITIONS = {
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", extra=None):
         super().__init__(message)
         self.message, self.status, self.code = message, status, code
+        self.extra = extra or {}
 
 
 def now():
@@ -106,6 +107,18 @@ class ProvenanceStore:
                     version INTEGER NOT NULL, snapshot TEXT NOT NULL,
                     changed_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(object_id,version)
+                );
+                CREATE TABLE IF NOT EXISTS loans(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    purpose TEXT NOT NULL, loan_start TEXT NOT NULL, loan_end TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'submitted'
+                        CHECK(status IN ('submitted','approved','rejected','invalidated','returned')),
+                    conflicts TEXT NOT NULL DEFAULT '[]',
+                    submitted_by TEXT NOT NULL REFERENCES users(id),
+                    reviewed_by TEXT REFERENCES users(id), review_note TEXT, reviewed_at TEXT,
+                    returned_by TEXT REFERENCES users(id), return_note TEXT, returned_at TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, object_id INTEGER REFERENCES objects(id),
@@ -197,6 +210,8 @@ class ProvenanceStore:
             )
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "object.update", {"version": new_version, "changes": clean})
+            self._invalidate_loans(conn, object_id, {"type": "object_update", "actor": user_id, "at": now(),
+                                                     "label": f"藏品资料修改（{','.join(clean)}）", "changes": clean})
             return {"id": object_id, "version": new_version, "changes": clean}
 
     def add_source(self, user_id, name, source_type, reference):
@@ -239,6 +254,8 @@ class ProvenanceStore:
             conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "event.add", {"event_id": cur.lastrowid, "version": new_version, "visibility": visibility})
+            self._invalidate_loans(conn, object_id, {"type": "event", "id": cur.lastrowid, "actor": user_id, "at": now(),
+                                                     "label": f"新增流转事件 #{cur.lastrowid}（{event_type.strip()}）"})
             return {"id": cur.lastrowid, "object_id": object_id, "object_version": new_version}
 
     def upload_evidence(self, user_id, object_id, filename, content_b64, visibility, event_id=None):
@@ -262,6 +279,8 @@ class ProvenanceStore:
                 (object_id, event_id, filename.strip(), digest, len(content), content, visibility, user_id, now()),
             )
             self._audit(conn, object_id, user_id, "evidence.upload", {"evidence_id": cur.lastrowid, "sha256": digest, "visibility": visibility})
+            self._invalidate_loans(conn, object_id, {"type": "evidence", "id": cur.lastrowid, "actor": user_id, "at": now(),
+                                                     "label": f"新增证据 {filename.strip()}"})
             return {"id": cur.lastrowid, "filename": filename.strip(), "sha256": digest, "size": len(content)}
 
     def create_claim(self, user_id, object_id, claimed_by, desired_outcome):
@@ -276,6 +295,8 @@ class ProvenanceStore:
                 (object_id, user_id, claimed_by.strip(), desired_outcome.strip(), now(), now()),
             )
             self._audit(conn, object_id, user_id, "claim.create", {"claim_id": cur.lastrowid})
+            self._invalidate_loans(conn, object_id, {"type": "claim", "id": cur.lastrowid, "actor": user_id, "at": now(),
+                                                     "label": f"新增权利主张 #{cur.lastrowid}（{claimed_by.strip()}）"})
             return {"id": cur.lastrowid, "object_id": object_id, "status": "submitted"}
 
     def transition_claim(self, user_id, claim_id, new_status, note):
@@ -306,6 +327,145 @@ class ProvenanceStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def _loan(self, conn, loan_id):
+        row = conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
+        if not row:
+            raise BusinessError("外借申请不存在", 404, "not_found")
+        return row
+
+    def _loan_blockers(self, conn, object_id, loan_start, loan_end, exclude_loan_id=None):
+        """外借批准的阻塞项：未结主张、无来源的公开事件、缺内部证据、时段重叠。"""
+        blockers = []
+        for c in conn.execute(
+            "SELECT id,claimed_by,status FROM claims WHERE object_id=? AND status NOT IN ('resolved_return','rejected') ORDER BY id",
+            (object_id,),
+        ).fetchall():
+            blockers.append({"code": "open_claim", "claim_id": c["id"],
+                             "message": f"存在未结主张 #{c['id']}（{c['claimed_by']}，状态 {c['status']}）"})
+        for e in conn.execute(
+            "SELECT id,event_type FROM events WHERE object_id=? AND visibility='public' AND source_id IS NULL ORDER BY id",
+            (object_id,),
+        ).fetchall():
+            blockers.append({"code": "event_without_source", "event_id": e["id"],
+                             "message": f"公开流转事件 #{e['id']}（{e['event_type']}）缺少来源"})
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM evidence WHERE object_id=? AND visibility='internal'", (object_id,)
+        ).fetchone()["n"]
+        if n == 0:
+            blockers.append({"code": "no_internal_evidence", "message": "缺少内部证据，至少上传一条内部证据"})
+        query = "SELECT id,loan_start,loan_end FROM loans WHERE object_id=? AND status='approved' AND loan_start<=? AND loan_end>=?"
+        params = [object_id, loan_end, loan_start]
+        if exclude_loan_id is not None:
+            query += " AND id<>?"
+            params.append(exclude_loan_id)
+        for l in conn.execute(query, params).fetchall():
+            blockers.append({"code": "overlapping_loan", "loan_id": l["id"],
+                             "message": f"与已批准外借 #{l['id']}（{l['loan_start']} ~ {l['loan_end']}）时段重叠"})
+        return blockers
+
+    def _invalidate_loans(self, conn, object_id, conflict):
+        """藏品资料、主张、事件或证据变化后，已批准的外借立即失效并记录冲突项。"""
+        for loan in conn.execute("SELECT * FROM loans WHERE object_id=? AND status='approved'", (object_id,)).fetchall():
+            conflicts = json.loads(loan["conflicts"]) + [conflict]
+            conn.execute(
+                "UPDATE loans SET status='invalidated',conflicts=?,updated_at=? WHERE id=?",
+                (json.dumps(conflicts, ensure_ascii=False, sort_keys=True), now(), loan["id"]),
+            )
+            self._audit(conn, object_id, conflict["actor"], "loan.invalidate", {"loan_id": loan["id"], "conflict": conflict})
+
+    def submit_loan(self, user_id, object_id, loan_start, loan_end, purpose):
+        if not str(purpose).strip():
+            raise BusinessError("外借用途不能为空", 422, "invalid_loan")
+        try:
+            start = date.fromisoformat(loan_start)
+            end = date.fromisoformat(loan_end)
+        except (ValueError, TypeError):
+            raise BusinessError("借展日期必须是 YYYY-MM-DD", 422, "invalid_date")
+        if end < start:
+            raise BusinessError("借展结束日期不能早于开始日期", 422, "invalid_date_range")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            self._object(conn, object_id)
+            cur = conn.execute(
+                "INSERT INTO loans(object_id,purpose,loan_start,loan_end,submitted_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (object_id, purpose.strip(), loan_start, loan_end, user_id, now(), now()),
+            )
+            self._audit(conn, object_id, user_id, "loan.submit", {"loan_id": cur.lastrowid, "loan_start": loan_start, "loan_end": loan_end})
+            return {"id": cur.lastrowid, "object_id": object_id, "status": "submitted"}
+
+    def review_loan(self, user_id, loan_id, decision, note):
+        if decision not in {"approve", "reject"}:
+            raise BusinessError("decision 必须是 approve 或 reject", 422, "invalid_decision")
+        if len(note.strip()) < 5:
+            raise BusinessError("审批说明至少 5 字", 422, "review_note_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                loan = self._loan(conn, loan_id)
+                if loan["status"] != "submitted":
+                    raise BusinessError(f"当前状态 {loan['status']} 不能审批", 409, "invalid_state")
+                new_status = "approved" if decision == "approve" else "rejected"
+                if decision == "approve":
+                    blockers = self._loan_blockers(conn, loan["object_id"], loan["loan_start"], loan["loan_end"], loan["id"])
+                    if blockers:
+                        raise BusinessError("存在阻塞项，暂不能批准外借", 409, "loan_blocked", {"blockers": blockers})
+                conn.execute(
+                    "UPDATE loans SET status=?,reviewed_by=?,review_note=?,reviewed_at=?,updated_at=? WHERE id=?",
+                    (new_status, user_id, note.strip(), now(), now(), loan_id),
+                )
+                self._audit(conn, loan["object_id"], user_id, f"loan.{decision}", {"loan_id": loan_id, "note": note.strip()})
+                return {"loan_id": loan_id, "status": new_status}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def return_loan(self, user_id, loan_id, note):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                loan = self._loan(conn, loan_id)
+                if loan["status"] not in {"approved", "invalidated"}:
+                    raise BusinessError(f"当前状态 {loan['status']} 不能登记归还", 409, "invalid_state")
+                conn.execute(
+                    "UPDATE loans SET status='returned',returned_by=?,return_note=?,returned_at=?,updated_at=? WHERE id=?",
+                    (user_id, note.strip(), now(), now(), loan_id),
+                )
+                self._audit(conn, loan["object_id"], user_id, "loan.return", {"loan_id": loan_id, "from_status": loan["status"]})
+                return {"loan_id": loan_id, "status": "returned"}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _loan_view(self, conn, row):
+        item = dict(row)
+        item["conflicts"] = json.loads(item["conflicts"])
+        if item["status"] == "submitted":
+            item["blockers"] = self._loan_blockers(conn, item["object_id"], item["loan_start"], item["loan_end"], item["id"])
+        return item
+
+    def list_loans(self, user_id, object_id=None):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            query = "SELECT l.*,o.inventory_no,o.title FROM loans l JOIN objects o ON o.id=l.object_id"
+            params = []
+            if object_id is not None:
+                query += " WHERE l.object_id=?"
+                params.append(object_id)
+            rows = conn.execute(query + " ORDER BY l.id", params).fetchall()
+            return [self._loan_view(conn, r) for r in rows]
+
+    def get_loan(self, user_id, loan_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            row = conn.execute(
+                "SELECT l.*,o.inventory_no,o.title FROM loans l JOIN objects o ON o.id=l.object_id WHERE l.id=?", (loan_id,)
+            ).fetchone()
+            if not row:
+                raise BusinessError("外借申请不存在", 404, "not_found")
+            return self._loan_view(conn, row)
 
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
@@ -426,11 +586,24 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if parts == ["api", "loans"] and method == "GET":
+            q = parse_qs(parsed.query)
+            object_id = int(q["object_id"][0]) if q.get("object_id") else None
+            return self._send(200, {"items": store.list_loans(user, object_id)})
+        if parts == ["api", "loans"] and method == "POST":
+            d = self._body(); return self._send(201, store.submit_loan(user, d.get("object_id"), d.get("loan_start", ""), d.get("loan_end", ""), d.get("purpose", "")))
+        if len(parts) >= 3 and parts[:2] == ["api", "loans"]:
+            loan_id = int(parts[2])
+            if len(parts) == 3 and method == "GET": return self._send(200, store.get_loan(user, loan_id))
+            if len(parts) == 4 and parts[3] == "review" and method == "POST":
+                d = self._body(); return self._send(200, store.review_loan(user, loan_id, d.get("decision", ""), d.get("note", "")))
+            if len(parts) == 4 and parts[3] == "return" and method == "POST":
+                d = self._body(); return self._send(200, store.return_loan(user, loan_id, d.get("note", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}, **exc.extra})
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 
