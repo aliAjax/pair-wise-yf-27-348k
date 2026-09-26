@@ -1,4 +1,195 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>藏品临时外借审批</title>
+<style>
+  body{font:15px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#222}
+  h1{font-size:22px}h2{font-size:17px;margin-top:0}
+  .panel{border:1px solid #bbb;border-radius:8px;padding:14px 16px;margin:14px 0}
+  select,input,button,textarea{padding:7px 9px;margin:3px 4px 3px 0;border:1px solid #999;border-radius:5px;font:inherit}
+  button{cursor:pointer;background:#f6f6f6}button.primary{background:#28614a;color:#fff;border-color:#28614a}
+  button.danger{background:#8a2f2f;color:#fff;border-color:#8a2f2f}
+  button.warn{background:#946b1c;color:#fff;border-color:#946b1c}
+  pre{background:#f4f4f4;padding:10px;white-space:pre-wrap;font-size:12px;border-radius:6px;max-height:300px;overflow:auto}
+  .loan{border:1px solid #ccc;border-radius:8px;padding:12px 14px;margin:10px 0;background:#fafafa}
+  .loan h3{margin:0 0 6px;font-size:15px}
+  .meta{color:#555;font-size:13px;margin:2px 0}
+  .badge{display:inline-block;padding:1px 9px;border-radius:10px;font-size:12px;color:#fff;margin-left:6px}
+  .s-pending{background:#946b1c}.s-approved{background:#28614a}.s-invalidated{background:#8a2f2f}.s-returned{background:#555}
+  .blocks{background:#fdf2ec;border:1px solid #d9a08a;border-radius:6px;padding:8px 12px;margin:8px 0}
+  .conflicts{background:#fbeeee;border:1px solid #d19a9a;border-radius:6px;padding:8px 12px;margin:8px 0}
+  .blocks h4,.conflicts h4{margin:0 0 4px;font-size:13px}
+  .blocks ul,.conflicts ul{margin:4px 0;padding-left:20px}
+  .ok{color:#28614a}.err{color:#8a2f2f}
+  #msg{min-height:22px;margin:8px 0;font-weight:600}
+  label{display:inline-block;min-width:70px}
+  .hint{color:#666;font-size:12px}
+</style>
+</head>
+<body>
+<h1>博物馆藏品来源与返还审查 · 临时外借审批</h1>
+
+<div class="panel">
+  <label>演示身份</label>
+  <select id="user" onchange="roleChanged()">
+    <option value="staff">staff 工作人员</option>
+    <option value="reviewer1">reviewer1 审查员</option>
+    <option value="claimant1">claimant1 主张人</option>
+    <option value="public">public 公众</option>
+  </select>
+  <span class="hint">外借功能仅工作人员与审查员可见。</span>
+</div>
+
+<div id="msg"></div>
+
+<div id="staffPanel" class="panel" style="display:none">
+  <h2>① 提交临时外借申请</h2>
+  <div><label>藏品</label><select id="loanObject"></select></div>
+  <div><label>借展开始</label><input type="date" id="loanStart"> <label>借展结束</label><input type="date" id="loanEnd"></div>
+  <div><label>用途</label><input type="text" id="loanPurpose" size="50" placeholder="如：赴外馆参加特展"></div>
+  <button class="primary" onclick="applyLoan()">提交申请</button>
+</div>
+
+<div id="reviewPanel" class="panel" style="display:none">
+  <h2>② 外借申请审批</h2>
+  <p class="hint">通过条件：无未结主张；每个公开流转事件都有来源；至少一条内部证据；借展时段与已批准外借不重叠。
+  批准后藏品若新增主张、事件、证据或资料被修改，批准自动失效；归还后留档，不再占用时段。</p>
+  <div id="loans"></div>
+</div>
+
+<div class="panel">
+  <h2 id="catalogTitle">藏品查看</h2>
+  <button onclick="loadObjects()">刷新藏品列表</button>
+  <pre id="objects">点击“刷新藏品列表”。</pre>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+function role(){ return $("user").value; }
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function msg(text, ok){ const el=$("msg"); el.textContent=text; el.className=ok?"ok":"err"; }
+
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({headers:{"X-User-Id":role(),"Content-Type":"application/json"}}, opts));
+  let data = {};
+  try { data = await r.json(); } catch(e) {}
+  if(!r.ok) throw Object.assign(new Error(data.error?.message || ("HTTP "+r.status)), {data});
+  return data;
+}
+
+const STATUS_LABEL = {pending:"待审批", approved:"已批准（外借中）", invalidated:"已失效", returned:"已归还留档"};
+
+function roleChanged(){
+  const r = role();
+  $("staffPanel").style.display = r === "staff" ? "block" : "none";
+  $("reviewPanel").style.display = (r === "staff" || r === "reviewer1") ? "block" : "none";
+  $("catalogTitle").textContent = (r === "staff" || r === "reviewer1") ? "藏品登记资料（内部）" : "公开藏品目录";
+  $("msg").textContent = "";
+  if(r === "staff" || r === "reviewer1"){ loadObjects().then(loadLoans); }
+  else { loadObjects(); $("loans").innerHTML = ""; }
+}
+
+async function loadObjects(){
+  try{
+    const data = await api("/api/objects");
+    $("objects").textContent = JSON.stringify(data, null, 2);
+    if(role() === "staff"){
+      const sel = $("loanObject");
+      sel.innerHTML = (data.items || []).map(o => `<option value="${o.id}">#${o.id} ${esc(o.inventory_no)} ${esc(o.title)}</option>`).join("");
+    }
+  }catch(e){ $("objects").textContent = "加载失败：" + e.message; }
+}
+
+function renderBlocks(blocks){
+  if(!blocks || !blocks.length) return "";
+  return `<div class="blocks"><h4>⛔ 阻塞原因（${blocks.length}）</h4><ul>` +
+    blocks.map(b => `<li>${esc(b.message)}</li>`).join("") + "</ul></div>";
+}
+function renderConflicts(conflicts){
+  if(!conflicts || !conflicts.length) return "";
+  return `<div class="conflicts"><h4>⚠ 批准后冲突项（${conflicts.length}）</h4><ul>` +
+    conflicts.map(c => `<li>${esc(c.message)}</li>`).join("") + "</ul></div>";
+}
+
+function loanCard(l){
+  const canReview = role() === "reviewer1";
+  let actions = "";
+  if(l.status === "pending"){
+    actions = canReview
+      ? `<button class="primary" onclick="decide(${l.id},'approve')">通过</button>
+         <button class="danger" onclick="decide(${l.id},'reject')">驳回</button>
+         <span class="hint">驳回将删除该申请；有阻塞项时无法通过。</span>`
+      : `<span class="hint">等待审查员审批。</span>`;
+  } else if(l.status === "approved"){
+    actions = `<button class="warn" onclick="returnLoan(${l.id})">确认归还</button>
+               <span class="hint">批准于 ${esc(l.approved_at)}；期间藏品若变更将自动失效。</span>`;
+  } else if(l.status === "returned"){
+    actions = `<span class="hint">归还时间 ${esc(l.returned_at)}，经手人 ${esc(l.archive?.returned_by)}，已留档。</span>`;
+  } else if(l.status === "invalidated"){
+    actions = `<span class="hint">失效时间见冲突项；需重新提交申请。</span>`;
+  }
+  return `<div class="loan">
+    <h3>外借申请 #${l.id} · ${esc(l.object_inventory_no)} ${esc(l.object_title)}
+      <span class="badge s-${l.status}">${STATUS_LABEL[l.status] || l.status}</span></h3>
+    <div class="meta">借展时段：${esc(l.loan_start)} 至 ${esc(l.loan_end)}　用途：${esc(l.purpose)}</div>
+    <div class="meta">申请人：${esc(l.requested_by)}　提交于 ${esc(l.created_at)}${l.reviewed_by ? `　审查员：${esc(l.reviewed_by)}` : ""}</div>
+    ${renderBlocks(l.blocks)}${renderConflicts(l.conflicts)}
+    <div>${actions}</div>
+  </div>`;
+}
+
+async function loadLoans(){
+  try{
+    const data = await api("/api/loans");
+    const items = data.items || [];
+    $("loans").innerHTML = items.length ? items.map(loanCard).join("")
+      : `<p class="hint">暂无外借申请。工作人员可在上方提交。</p>`;
+  }catch(e){ $("loans").innerHTML = `<p class="err">加载失败：${esc(e.message)}</p>`; }
+}
+
+async function applyLoan(){
+  const object_id = Number($("loanObject").value);
+  const body = {object_id, loan_start:$("loanStart").value, loan_end:$("loanEnd").value, purpose:$("loanPurpose").value};
+  try{
+    await api(`/api/objects/${object_id}/loans`, {method:"POST", body:JSON.stringify(body)});
+    msg("申请已提交，等待审查员审批。", true);
+    $("loanPurpose").value = "";
+    loadLoans();
+  }catch(e){
+    msg("提交失败：" + e.message);
+  }
+}
+
+async function decide(id, decision){
+  if(decision === "reject" && !confirm("确认驳回该外借申请？申请将被删除。")) return;
+  try{
+    const data = await api(`/api/loans/${id}/${decision}`, {method:"POST", body:"{}"});
+    if(decision === "approve"){ msg(`外借申请 #${id} 已通过。`, true); }
+    else { msg(`外借申请 #${id} 已驳回。`, true); }
+    loadLoans(); loadObjects();
+  }catch(e){
+    if(e.data?.error?.details?.blocks){
+      msg(`外借申请 #${id} 无法通过，存在 ${e.data.error.details.blocks.length} 项阻塞，详见列表。`);
+      loadLoans();
+    } else {
+      msg("操作失败：" + e.message);
+    }
+  }
+}
+
+async function returnLoan(id){
+  const note = prompt("归还核对说明（至少 5 字，将随档案留存）：", "藏品完好归还并核对入藏。");
+  if(note === null) return;
+  try{
+    await api(`/api/loans/${id}/return`, {method:"POST", body:JSON.stringify({note})});
+    msg(`外借申请 #${id} 已归还并留档。`, true);
+    loadLoans(); loadObjects();
+  }catch(e){ msg("归还失败：" + e.message); }
+}
+
+roleChanged();
+</script>
+</body>
+</html>
